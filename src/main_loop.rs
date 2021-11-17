@@ -21,6 +21,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 pub struct LibreSpotConnection {
@@ -67,8 +68,14 @@ fn new_dbus_server(
     session: Session,
     spirc: Arc<Spirc>,
     device_name: String,
+    event_rx: UnboundedReceiver<PlayerEvent>,
 ) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
-    Some(Box::pin(DbusServer::new(session, spirc, device_name)))
+    Some(Box::pin(DbusServer::new(
+        session,
+        spirc,
+        device_name,
+        event_rx,
+    )))
 }
 
 #[cfg(not(feature = "dbus_mpris"))]
@@ -76,6 +83,7 @@ fn new_dbus_server(
     _: Session,
     _: Arc<Spirc>,
     _: String,
+    _: UnboundedReceiver<PlayerEvent>,
 ) -> Option<Pin<Box<dyn Future<Output = ()>>>> {
     None
 }
@@ -93,6 +101,8 @@ pub(crate) struct MainLoopState {
     pub(crate) shell: String,
     pub(crate) device_type: DeviceType,
     pub(crate) use_mpris: bool,
+    #[cfg(feature = "dbus_mpris")]
+    pub(crate) mpris_event_tx: Option<UnboundedSender<PlayerEvent>>,
 }
 
 impl Future for MainLoopState {
@@ -130,6 +140,9 @@ impl Future for MainLoopState {
                 if let Some(ref mut player_event_channel) = self.spotifyd_state.player_event_channel
                 {
                     if let Poll::Ready(Some(event)) = player_event_channel.poll_next_unpin(cx) {
+                        if let Some(ref tx) = self.mpris_event_tx {
+                            tx.send(event.clone()).unwrap();
+                        }
                         if let Some(ref cmd) = self.spotifyd_state.player_event_program {
                             match spawn_program_on_event(&self.shell, cmd, event) {
                                 Ok(child) => self.running_event_program = Some(child),
@@ -180,10 +193,13 @@ impl Future for MainLoopState {
                 self.librespot_connection.spirc = Some(shared_spirc.clone());
 
                 if self.use_mpris {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    self.mpris_event_tx = Some(tx);
                     self.spotifyd_state.dbus_mpris_server = new_dbus_server(
                         session,
                         shared_spirc,
                         self.spotifyd_state.device_name.clone(),
+                        rx,
                     );
                 }
             } else if self
